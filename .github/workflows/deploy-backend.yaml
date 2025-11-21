@@ -1,0 +1,82 @@
+name: Deploy Python Backend to GCP VM
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write   # for OIDC / WIF
+      contents: read
+
+    env:
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      GCP_PROJECT_NUMBER: ${{ secrets.GCP_PROJECT_NUMBER }}
+      GCP_WIF_POOL_ID: ${{ secrets.GCP_WIF_POOL_ID }}
+      GCP_WIF_PROVIDER_ID: ${{ secrets.GCP_WIF_PROVIDER_ID }}
+      GCP_SA_EMAIL: ${{ secrets.GCP_SA_EMAIL }}
+      GCP_VM_NAME: ${{ secrets.GCP_VM_NAME }}
+      GCP_VM_ZONE: ${{ secrets.GCP_VM_ZONE }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: "projects/${{ env.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.GCP_WIF_POOL_ID }}/providers/${{ env.GCP_WIF_PROVIDER_ID }}"
+          service_account: ${{ env.GCP_SA_EMAIL }}
+          token_format: "access_token"
+
+      - name: Set up gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Fetch secrets from Secret Manager
+        id: secrets
+        run: |
+          DB_URL=$(gcloud secrets versions access latest --secret="db-url")
+          EXTERNAL_API_KEY=$(gcloud secrets versions access latest --secret="external-api-key")
+
+          # Do NOT echo secret values
+          cat > .env <<EOF_ENV
+          DB_URL=${DB_URL}
+          EXTERNAL_API_KEY=${EXTERNAL_API_KEY}
+          EOF_ENV
+
+          chmod 600 .env
+
+      - name: Package app
+        run: |
+          tar -czf app.tar.gz app.py requirements.txt .env
+
+      - name: Copy app to VM
+        run: |
+          gcloud compute scp app.tar.gz ${GCP_VM_NAME}:~ --zone=${GCP_VM_ZONE}
+
+      - name: Deploy on VM
+        run: |
+          gcloud compute ssh ${GCP_VM_NAME} --zone=${GCP_VM_ZONE} --command="
+            mkdir -p ~/backend-app &&
+            mv ~/app.tar.gz ~/backend-app/ &&
+            cd ~/backend-app &&
+            tar -xzf app.tar.gz &&
+            rm -f app.tar.gz &&
+
+            python3 -m venv venv || true &&
+            source venv/bin/activate &&
+            pip install --upgrade pip &&
+            pip install -r requirements.txt &&
+
+            sudo systemctl restart backend.service
+          "
